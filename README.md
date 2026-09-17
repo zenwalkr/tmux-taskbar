@@ -13,7 +13,15 @@ Clone this repository and run:
 The installer links the generated tmux configuration into `~/.tmux.conf`,
 adds the taskbar command to `PATH`, and preserves existing configuration in
 timestamped backup files. Run `./user-tmux-taskbar --start` to start a new
-taskbar session, or `./user-tmux-taskbar --settings` to configure it.
+taskbar session.
+
+## Primary use
+
+The taskbar is designed to be used with the mouse. After it is running, click
+the tmux status-bar items to open menus, switch or close sessions, change
+settings, and interact with extensions. The direct command-line flags are
+mainly for installation, startup, scripting, and troubleshooting; `--settings`
+is available as a direct fallback for the settings menu.
 
 ## Included extensions
 
