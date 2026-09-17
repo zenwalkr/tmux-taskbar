@@ -1,0 +1,13 @@
+# Runtime data generated beside the taskbar executable.
+user-tmux-taskbar-data/cache/
+user-tmux-taskbar-data/state/
+user-tmux-taskbar-data/logs/
+user-tmux-taskbar-data/user-tmux/
+
+# Local taskbar settings and installer backups.
+user-tmux-taskbar-data/*.conf
+user-tmux-taskbar-data/*.conf.tmux-taskbar-backup.*
+user-tmux-taskbar-data/*.tmuxtask.tmux-taskbar-backup.*
+user-tmux-taskbar-data/*.log
+user-tmux-taskbar-data/*.tsv
+*.tmux-taskbar-backup.*

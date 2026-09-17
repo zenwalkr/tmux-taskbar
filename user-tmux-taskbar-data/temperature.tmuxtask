@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+
+# tmux-taskbar extension: show the most useful CPU/system thermal reading
+# without requiring lm-sensors.  Linux exposes these readings in sysfs.
+
+set -u
+
+best_temp=''
+best_priority=99
+
+for temp_file in /sys/class/thermal/thermal_zone*/temp; do
+    [ -r "$temp_file" ] || continue
+    raw=$(<"$temp_file")
+    [[ "$raw" =~ ^[0-9]+$ ]] || continue
+    [ "$raw" -gt 0 ] || continue
+
+    type_file="${temp_file%/temp}/type"
+    zone_type=''
+    [ -r "$type_file" ] && zone_type=$(<"$type_file")
+    zone_type=${zone_type,,}
+
+    priority=5
+    case "$zone_type" in
+        *x86_pkg*|*package*|*coretemp*) priority=1 ;;
+        *cpu*|*soc*) priority=2 ;;
+        *thermal*) priority=3 ;;
+    esac
+
+    if [ "$priority" -lt "$best_priority" ]; then
+        best_temp=$raw
+        best_priority=$priority
+    fi
+done
+
+if [ -n "$best_temp" ]; then
+    # Kernel thermal values are normally millidegrees Celsius.  Round down to
+    # keep the taskbar compact and stable.
+    printf 'TEMP:%sC\n' "$((best_temp / 1000))"
+else
+    printf 'TEMP:--\n'
+fi

@@ -1,0 +1,1744 @@
+#!/usr/bin/env bash
+
+# Single-file tmux taskbar installer, launcher, and runtime.
+#
+# The only taskbar implementation file is this script.  Runtime configuration
+# is generated beside it and linked from ~/.tmux.conf; user settings, themes,
+# and schedules remain persistent data. Extension scripts and extension-owned
+# cache, state, and scheduler log data live below user-tmux-taskbar-data/.
+
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
+INSTALL_HOME="${HOME:?HOME must be set}"
+CONFIG_FILE="$SCRIPT_DIR/.tmux.conf"
+EXTENSION_DIR="$SCRIPT_DIR/user-tmux-taskbar-data"
+EXTENSION_LOG_DIR="$EXTENSION_DIR/logs"
+BASHRC="$INSTALL_HOME/.bashrc"
+LEGACY_BIN_DIR="$INSTALL_HOME/Bin"
+PLUGIN_CACHE_DIR="$EXTENSION_DIR/cache"
+TASKBAR_STATE_DIR="${XDG_STATE_HOME:-$INSTALL_HOME/.local/state}/tmux-taskbar"
+RECENT_DIRS_FILE="$TASKBAR_STATE_DIR/recent-dirs"
+RECENT_DIRS_SNAPSHOT_FILE="$TASKBAR_STATE_DIR/recent-pane-dirs"
+PLUGIN_SETTINGS_FILE="$EXTENSION_DIR/extensions.conf"
+ORDER_SETTINGS_FILE="$EXTENSION_DIR/order.conf"
+POSITION_SETTINGS_FILE="$EXTENSION_DIR/positions.conf"
+DEFAULT_HEALTH_INTERVAL=300
+DEFAULT_EXTENSION_LINES=1
+MAX_EXTENSION_LINES=4
+STAMP="$(date +%Y%m%d-%H%M%S)"
+declare -A BACKED_UP=()
+
+find_tmux() {
+    local candidate
+    if [ -n "${TMUX_TASKBAR_REAL_TMUX:-}" ] && [ -x "$TMUX_TASKBAR_REAL_TMUX" ]; then
+        printf '%s' "$TMUX_TASKBAR_REAL_TMUX"
+        return 0
+    fi
+    for candidate in /usr/bin/tmux /bin/tmux /usr/local/bin/tmux; do
+        if [ -x "$candidate" ] && [ "$candidate" != "$SCRIPT_PATH" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+require_tmux() {
+    TMUX_BIN="$(find_tmux || true)"
+    if [ -z "$TMUX_BIN" ]; then
+        printf '%s\n' 'Error: tmux was not found in /usr/bin, /bin, or /usr/local/bin.' >&2
+        exit 1
+    fi
+}
+
+backup_file() {
+    local path="$1"
+    [ -n "${BACKED_UP[$path]:-}" ] && return 0
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        cp -a -- "$path" "$path.tmux-taskbar-backup.$STAMP"
+        printf 'Backed up %s to %s\n' "$path" "$path.tmux-taskbar-backup.$STAMP"
+        BACKED_UP[$path]=1
+    fi
+}
+
+install_link() {
+    local source="$1" destination="$2"
+    if [ -e "$destination" ] || [ -L "$destination" ]; then
+        [ "$(readlink -f "$destination" 2>/dev/null || true)" = "$source" ] || backup_file "$destination"
+        rm -f -- "$destination"
+    fi
+    ln -s -- "$source" "$destination"
+}
+
+remove_bash_hooks() {
+    local temp
+    [ -f "$BASHRC" ] || return 0
+    if grep -Fq '# >>> tmux-taskbar source PATH >>>' "$BASHRC" || \
+       grep -Fq '# >>> tmux-taskbar auto-start >>>' "$BASHRC" || \
+       grep -Fq '# >>> tmux-taskbar exit hook >>>' "$BASHRC"; then
+        backup_file "$BASHRC"
+        temp=$(mktemp)
+        awk '
+            /^# >>> tmux-taskbar source PATH >>>$/ { source_path=1; next }
+            /^# <<< tmux-taskbar source PATH <<</ { source_path=0; next }
+            /^# >>> tmux-taskbar auto-start >>>$/ { auto_start=1; next }
+            /^# <<< tmux-taskbar auto-start <<</ { auto_start=0; next }
+            /^# >>> tmux-taskbar exit hook >>>$/ { exit_hook=1; next }
+            /^# <<< tmux-taskbar exit hook <<</ { exit_hook=0; next }
+            !source_path && !auto_start && !exit_hook { print }
+        ' "$BASHRC" > "$temp"
+        mv "$temp" "$BASHRC"
+    fi
+}
+
+install_bash_hooks() {
+    local temp source_q
+    [ -f "$BASHRC" ] || return 0
+    remove_bash_hooks
+    source_q=$(printf '%q' "$SCRIPT_PATH")
+    backup_file "$BASHRC"
+    temp=$(mktemp)
+    cat "$BASHRC" > "$temp"
+    cat >> "$temp" <<EOF
+
+# >>> tmux-taskbar source PATH >>>
+TMUX_TASKBAR_SOURCE_DIR=$(printf '%q' "$SCRIPT_DIR")
+case ":\${PATH:-}:" in
+    *:"\$TMUX_TASKBAR_SOURCE_DIR":*) ;;
+    *) PATH="\$TMUX_TASKBAR_SOURCE_DIR\${PATH:+:\$PATH}" ;;
+esac
+export PATH
+unset TMUX_TASKBAR_SOURCE_DIR
+# <<< tmux-taskbar source PATH <<<
+
+# >>> tmux-taskbar auto-start >>>
+if [ -z "\${TMUX_TASKBAR_NO_AUTO_START:-}" ] && [ -z "\${TMUX:-}" ]; then
+    printf '%s' 'Starting tmux in 3 seconds (press Enter to cancel)... '
+    if IFS= read -r -t 3; then
+        printf '%s\\n' 'cancelled'
+    else
+        printf '%s\\n' 'starting'
+        $source_q --start
+    fi
+fi
+# <<< tmux-taskbar auto-start <<<
+
+# >>> tmux-taskbar exit hook >>>
+if [ -n "\${TMUX:-}" ] && [ -n "\${TMUX_PANE:-}" ]; then
+    exit() {
+        local current_session
+        current_session=\$(tmux display-message -p -t "\$TMUX_PANE" '#{session_id}') || {
+            builtin exit
+            return
+        }
+        if tmux switch-client -n 2>/dev/null; then
+            tmux kill-session -t "\$current_session"
+        else
+            builtin exit
+        fi
+    }
+fi
+# <<< tmux-taskbar exit hook <<<
+EOF
+    mv "$temp" "$BASHRC"
+}
+
+generate_config() {
+    local script_q
+    script_q=$(printf '%q' "$SCRIPT_PATH")
+    cat <<EOF
+# Generated by user-tmux-taskbar.  The implementation lives in $SCRIPT_PATH.
+set -g mouse on
+set -g status on
+set -g status-position bottom
+set -g status-interval 1
+set -g status-style "fg=black,bg=colour7"
+set -g status-left-length 12
+set -g status-right-length 80
+set -g status-justify left
+set -g @tmux_taskbar_health_interval $DEFAULT_HEALTH_INTERVAL
+set -g @tmux_taskbar_clock_format 12
+set -g @tmux_taskbar_stat_cpu 1
+set -g @tmux_taskbar_stat_ram 1
+set -g @tmux_taskbar_stat_disk 1
+set -g @tmux_taskbar_stats_minimal 0
+set -g @tmux_taskbar_stats_pad_percent 0
+set -g @tmux_taskbar_mrc_display both
+set -g @tmux_taskbar_mrc_delta 1
+set -g @tmux_taskbar_mrc_level 0
+set -g @tmux_taskbar_mrc_timeout 5
+set -g @tmux_taskbar_network_device auto
+set -g @tmux_taskbar_network_show_device 1
+set -g @tmux_taskbar_extension_spacing wide
+set -g @tmux_taskbar_extension_lines $DEFAULT_EXTENSION_LINES
+
+if-shell '[ -f "\$HOME/.tmux-theme.conf" ]' 'source-file "\$HOME/.tmux-theme.conf"'
+
+set -g status-format[0] '#[fg=black]#[bg=colour7]#[range=left] Start #[norange] #{S:#[range=session|#{session_id}]#{?#{==:#{session_name},#{client_session}},#[fg=white]#[bg=colour4],#{?session_attached,#[fg=colour7]#[bg=colour8],#[fg=black]#[bg=colour7]}}#[bold] [ #{session_name} ]#[nobold]#[norange]}#[norange]#($script_q --record-dirs)'
+set -g status-format[1] '#[fg=black]#[bg=colour7]#[norange]#[align=left]#($script_q --row-status-line 1 left)#[align=right]#($script_q --row-status-line 1 right)#[norange]'
+set -g status-format[2] '#[fg=black]#[bg=colour7]#[norange]#[align=left]#($script_q --row-status-line 2 left)#[align=right]#($script_q --row-status-line 2 right)#[norange]'
+set -g status-format[3] '#[fg=black]#[bg=colour7]#[norange]#[align=left]#($script_q --row-status-line 3 left)#[align=right]#($script_q --row-status-line 3 right)#[norange]'
+set -g status-format[4] '#[fg=black]#[bg=colour7]#[norange]#[align=left]#($script_q --row-status-line 4 left)#[align=right]#($script_q --row-status-line 4 right)#[norange]'
+
+bind-key -T root MouseDown1Status run-shell "$script_q --mouse '#{mouse_status_line}' '#{mouse_x}'"
+unbind-key -T root MouseDown1StatusLeft
+unbind-key -T root MouseUp1StatusLeft
+unbind-key -T root C-Tab
+bind-key -T root MouseDown1StatusDefault run-shell "$script_q --mouse '#{mouse_status_line}' '#{mouse_x}'"
+bind-key -T root MouseDown1StatusRight run-shell "$script_q --mouse '#{mouse_status_line}' '#{mouse_x}'"
+bind-key -T root MouseDown1StatusLeft run-shell "$script_q --mouse '#{mouse_status_line}' '#{mouse_x}'"
+
+if-shell '[ -f "\$HOME/.tmux-taskbar.conf" ]' 'source-file "\$HOME/.tmux-taskbar.conf"'
+EOF
+}
+
+write_config() {
+    local temp
+    temp=$(mktemp "$CONFIG_FILE.tmp.XXXXXX")
+    generate_config > "$temp"
+    mv -f -- "$temp" "$CONFIG_FILE"
+}
+
+remove_legacy_files() {
+    local path
+    for path in \
+        "$SCRIPT_DIR/install-tmux-taskbar.sh" \
+        "$SCRIPT_DIR/tmux" \
+        "$SCRIPT_DIR/tmux-cron" \
+        "$SCRIPT_DIR/tmux-cron-menu" \
+        "$SCRIPT_DIR/tmux-taskbar-mouse" \
+        "$SCRIPT_DIR/tmux-taskbar-settings" \
+        "$SCRIPT_DIR/tmux-taskbar-status" \
+        "$SCRIPT_DIR/user-terminal-theme-manager" \
+        "$LEGACY_BIN_DIR/tmux" \
+        "$LEGACY_BIN_DIR/tmux-cron" \
+        "$LEGACY_BIN_DIR/tmux-cron-menu" \
+        "$LEGACY_BIN_DIR/tmux-taskbar-focus"; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            backup_file "$path"
+            rm -f -- "$path"
+            printf 'Removed obsolete taskbar file %s\n' "$path"
+        fi
+    done
+}
+
+install_taskbar() {
+    require_tmux
+    mkdir -p "$SCRIPT_DIR"
+    write_config
+    if [ -e "$INSTALL_HOME/.tmux.conf" ] || [ -L "$INSTALL_HOME/.tmux.conf" ]; then
+        if [ "$(readlink -f "$INSTALL_HOME/.tmux.conf" 2>/dev/null || true)" != "$CONFIG_FILE" ]; then
+            backup_file "$INSTALL_HOME/.tmux.conf"
+        fi
+        rm -f -- "$INSTALL_HOME/.tmux.conf"
+    fi
+    ln -s -- "$CONFIG_FILE" "$INSTALL_HOME/.tmux.conf"
+    install_bash_hooks
+    remove_legacy_files
+    if "$TMUX_BIN" has-session 2>/dev/null; then
+        "$TMUX_BIN" source-file "$CONFIG_FILE"
+        printf '%s\n' 'Reloaded the active tmux server configuration.'
+    fi
+    printf '%s\n' 'tmux taskbar installation complete.'
+}
+
+uninstall_taskbar() {
+    local path
+    remove_bash_hooks
+    for path in "$INSTALL_HOME/.tmux.conf" "$INSTALL_HOME/.tmux-taskbar.conf" "$PLUGIN_SETTINGS_FILE" "$ORDER_SETTINGS_FILE" "$POSITION_SETTINGS_FILE" "$CONFIG_FILE" "$RECENT_DIRS_FILE" "$RECENT_DIRS_SNAPSHOT_FILE" "$EXTENSION_DIR/user-server-health.tmuxtask" "$EXTENSION_DIR/midnight-risk-clock.tmuxtask"; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            backup_file "$path"
+            rm -f -- "$path"
+            printf 'Removed %s\n' "$path"
+        fi
+    done
+    remove_legacy_files
+    printf '%s\n' 'tmux taskbar uninstallation complete.'
+    printf '%s\n' 'The canonical ./tmux-taskbar file was retained.'
+}
+
+start_taskbar() {
+    local session_name=tmux-1 session_number=1
+    require_tmux
+    while "$TMUX_BIN" has-session -t "$session_name" 2>/dev/null; do
+        session_number=$((session_number + 1))
+        session_name="tmux-$session_number"
+    done
+    if [ -n "${TMUX:-}" ]; then
+        "$TMUX_BIN" new-session -d -s "$session_name"
+        exec "$TMUX_BIN" switch-client -t "$session_name"
+    else
+        exec "$TMUX_BIN" new-session -s "$session_name"
+    fi
+}
+
+exit_taskbar() {
+    require_tmux
+    "$TMUX_BIN" detach-client -E 'TMUX_TASKBAR_NO_AUTO_START=1 exec bash --login'
+}
+
+kill_session() {
+    local target_session="${1:-}" current_session previous_session next_session found_target destination_session session_id
+    require_tmux
+    [ -n "$target_session" ] || { printf '%s\n' 'Error: no tmux session was supplied.' >&2; exit 2; }
+    current_session=""
+    if [ -n "${TMUX_PANE:-}" ]; then
+        current_session=$($TMUX_BIN display-message -p -t "$TMUX_PANE" '#{session_id}' 2>/dev/null || true)
+    fi
+    if [ -z "$current_session" ]; then
+        current_session=$($TMUX_BIN display-message -p '#{client_session}' 2>/dev/null || true)
+        [ -n "$current_session" ] && current_session=$($TMUX_BIN display-message -p -t "$current_session" '#{session_id}' 2>/dev/null || true)
+    fi
+    if [ "$target_session" = "$current_session" ]; then
+        previous_session=""; next_session=""; found_target=0
+        while IFS= read -r session_id; do
+            if [ "$session_id" = "$target_session" ]; then found_target=1; continue; fi
+            if [ "$found_target" -eq 0 ]; then previous_session="$session_id";
+            elif [ -z "$next_session" ]; then next_session="$session_id"; fi
+        done < <($TMUX_BIN list-sessions -F '#{session_id}')
+        destination_session="${previous_session:-$next_session}"
+        [ -n "$destination_session" ] && $TMUX_BIN switch-client -t "$destination_session"
+    fi
+    exec "$TMUX_BIN" kill-session -t "$target_session"
+}
+
+status_cpu_sample() {
+    local line total idle
+    read -r line total idle < <(awk '/^cpu / { print "cpu", $2+$3+$4+$5+$6+$7+$8, $5+$6; exit }' /proc/stat 2>/dev/null)
+    [ "${line:-}" = cpu ] && printf '%s %s' "$total" "$idle"
+}
+
+status_cpu() {
+    local first second total1 idle1 total2 idle2 td id usage
+    first=$(status_cpu_sample || true); [ -n "$first" ] || { printf '%s' '--'; return; }
+    read -r total1 idle1 <<< "$first"; sleep 0.1
+    second=$(status_cpu_sample || true); [ -n "$second" ] || { printf '%s' '--'; return; }
+    read -r total2 idle2 <<< "$second"; td=$((total2-total1)); id=$((idle2-idle1))
+    [ "$td" -gt 0 ] || { printf '%s' '--'; return; }
+    usage=$((100*(td-id)/td)); [ "$usage" -lt 0 ] && usage=0; [ "$usage" -gt 100 ] && usage=100
+    if [ "$(system_stats_pad_percent)" = 1 ]; then
+        printf '%03d%%' "$usage"
+    else
+        printf '%s%%' "$usage"
+    fi
+}
+
+status_ram() {
+    local value
+    value=$(free -b 2>/dev/null | awk '/^Mem:/ && $2 > 0 { printf "%d", (($2-$7)*100)/$2; exit }')
+    if [ -n "$value" ]; then
+        if [ "$(system_stats_pad_percent)" = 1 ]; then
+            printf '%03d%%' "$value"
+        else
+            printf '%s%%' "$value"
+        fi
+    else
+        printf '%s' '--'
+    fi
+}
+
+status_disk() {
+    local value
+    value=$(df -hP -- "$HOME" 2>/dev/null | awk 'NR == 2 { print $4; exit }')
+    [ -n "$value" ] && printf '%s' "$value" || printf '%s' '--'
+}
+
+tmux_option_value() {
+    local option="$1" default_value="$2" value
+    value=$(tmux show-options -gqv "$option" 2>/dev/null || true)
+    [ -n "$value" ] && printf '%s' "$value" || printf '%s' "$default_value"
+}
+
+clock_format_mode() {
+    local value
+    value=$(tmux_option_value @tmux_taskbar_clock_format 12)
+    [ "$value" = 24 ] && printf '%s' 24 || printf '%s' 12
+}
+
+system_stat_enabled() {
+    local stat="$1" value
+    value=$(tmux_option_value "@tmux_taskbar_stat_$stat" 1)
+    [ "$value" = 1 ] && printf '%s' 1 || printf '%s' 0
+}
+
+system_stats_minimal() {
+    local value
+    value=$(tmux_option_value @tmux_taskbar_stats_minimal 0)
+    [ "$value" = 1 ] && printf '%s' 1 || printf '%s' 0
+}
+
+system_stats_pad_percent() {
+    local value
+    value=$(tmux_option_value @tmux_taskbar_stats_pad_percent 0)
+    [ "$value" = 1 ] && printf '%s' 1 || printf '%s' 0
+}
+
+status_system_stats() {
+    local output='' separator=''
+    if [ "$(system_stats_minimal)" = 1 ]; then
+        if [ "$(system_stat_enabled cpu)" = 1 ]; then
+            output+='C:'"$(status_cpu)"
+            separator='/'
+        fi
+        if [ "$(system_stat_enabled ram)" = 1 ]; then
+            output+="$separator"'R:'"$(status_ram)"
+            separator='/'
+        fi
+        if [ "$(system_stat_enabled disk)" = 1 ]; then
+            output+="$separator"'D:'"$(status_disk)"
+        fi
+        printf '%s\n' "$output"
+        return 0
+    fi
+    if [ "$(system_stat_enabled cpu)" = 1 ]; then
+        output="CPU $(status_cpu)"
+    fi
+    if [ "$(system_stat_enabled ram)" = 1 ]; then
+        [ -n "$output" ] && output+='  '
+        output+="RAM $(status_ram)"
+    fi
+    if [ "$(system_stat_enabled disk)" = 1 ]; then
+        [ -n "$output" ] && output+='  '
+        output+="Disk $(status_disk) free"
+    fi
+    printf '%s\n' "$output"
+}
+
+status_taskbar() {
+    status_system_stats
+}
+
+status_clock() {
+    if [ "$(clock_format_mode)" = 24 ]; then
+        date '+%H:%M'
+    else
+        date '+%I:%M %p'
+    fi
+}
+
+health_interval_seconds() {
+    local value
+    value=$(tmux show-options -gqv @tmux_taskbar_health_interval 2>/dev/null || true)
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] && printf '%s' "$value" || printf '%s' "$DEFAULT_HEALTH_INTERVAL"
+}
+
+mrc_display_mode() {
+    local value
+    value=$(tmux_option_value @tmux_taskbar_mrc_display both)
+    case "$value" in both|clock|score) printf '%s' "$value" ;; *) printf '%s' both ;; esac
+}
+
+mrc_show_delta() {
+    [ "$(tmux_option_value @tmux_taskbar_mrc_delta 1)" = 1 ] && printf '%s' 1 || printf '%s' 0
+}
+
+mrc_show_level() {
+    [ "$(tmux_option_value @tmux_taskbar_mrc_level 0)" = 1 ] && printf '%s' 1 || printf '%s' 0
+}
+
+mrc_request_timeout() {
+    local value
+    value=$(tmux_option_value @tmux_taskbar_mrc_timeout 5)
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] && [ "$value" -le 30 ] && printf '%s' "$value" || printf '%s' 5
+}
+
+extension_spacing_mode() {
+    [ "$(tmux_option_value @tmux_taskbar_extension_spacing wide)" = compact ] && printf '%s' compact || printf '%s' wide
+}
+
+extension_line_count() {
+    local value
+    value=$(tmux_option_value @tmux_taskbar_extension_lines "$DEFAULT_EXTENSION_LINES")
+    if [[ "$value" =~ ^[1-4]$ ]]; then
+        printf '%s' "$((10#$value))"
+    else
+        printf '%s' "$DEFAULT_EXTENSION_LINES"
+    fi
+}
+
+network_device_setting() {
+    local value
+    value=$(tmux_option_value @tmux_taskbar_network_device auto)
+    if [ "$value" = auto ] || [[ "$value" =~ ^[[:alnum:]_.:@+-]+$ ]]; then
+        printf '%s' "$value"
+    else
+        printf '%s' auto
+    fi
+}
+
+network_device_info_enabled() {
+    [ "$(tmux_option_value @tmux_taskbar_network_show_device 1)" = 1 ] && printf '%s' 1 || printf '%s' 0
+}
+
+component_settings_key() {
+    case "$1" in
+        stats) printf '%s' '__system_stats__' ;;
+        clock) printf '%s' '__clock__' ;;
+        plugin:*) printf '%s' "${1#plugin:}" ;;
+        *) return 1 ;;
+    esac
+}
+
+component_enabled() {
+    local component_id="$1" settings_key enabled=1
+    settings_key=$(component_settings_key "$component_id") || return 1
+    if [ -r "$PLUGIN_SETTINGS_FILE" ]; then
+        enabled=$(awk -F '\t' -v key="$settings_key" '
+            $1 == key { value=$2 }
+            END { print (value == "0") ? 0 : 1 }
+        ' "$PLUGIN_SETTINGS_FILE")
+    fi
+    printf '%s' "$enabled"
+}
+
+plugin_enabled() {
+    component_enabled "plugin:$1"
+}
+
+plugin_status() {
+    local plugin="$1" plugin_name cache_key status_file stamp_file lock_dir now stamp age output temp interval
+    [ -f "$plugin" ] || return 0
+    plugin_name=${plugin##*/}
+    [ "$(plugin_enabled "$plugin_name")" = 1 ] || return 0
+    cache_key=${plugin_name%.tmuxtask}
+    cache_key=$(printf '%s' "$cache_key" | sed 's/[^A-Za-z0-9_.-]/_/g')
+    case "$plugin_name" in
+        network-rates.tmuxtask|network-totals.tmuxtask) interval=1 ;;
+        *) interval=$(health_interval_seconds) ;;
+    esac
+    mkdir -p "$PLUGIN_CACHE_DIR"
+    status_file="$PLUGIN_CACHE_DIR/$cache_key.status"
+    stamp_file="$PLUGIN_CACHE_DIR/$cache_key.stamp"
+    now=$(date +%s); stamp=0
+    [ -f "$stamp_file" ] && read -r stamp < "$stamp_file" || true
+    age=$((now - stamp))
+    if [ "$stamp" -le 0 ] || [ "$age" -ge "$interval" ] || [ ! -s "$status_file" ]; then
+        lock_dir="$PLUGIN_CACHE_DIR/$cache_key.lock"
+        if mkdir "$lock_dir" 2>/dev/null; then
+            output=$(XDG_CACHE_HOME="$EXTENSION_DIR/cache" \
+                XDG_STATE_HOME="$EXTENSION_DIR/state" \
+                bash "$plugin" 2>/dev/null || true)
+            [ -n "$output" ] || output="${cache_key^^}:FAIL"
+            output=$(printf '%s\n' "$output" | awk 'NF { line=$0 } END { print line }')
+            temp=$(mktemp "$PLUGIN_CACHE_DIR/.status.XXXXXX")
+            printf '%s\n' "$output" > "$temp"; mv -f -- "$temp" "$status_file"
+            printf '%s\n' "$now" > "$stamp_file"
+            rmdir "$lock_dir" 2>/dev/null || true
+        fi
+    fi
+    if [ -s "$status_file" ]; then
+        cat "$status_file"
+    fi
+}
+
+plugin_statuses() {
+    local plugin plugin_output
+    for plugin in "$EXTENSION_DIR"/*.tmuxtask; do
+        [ -f "$plugin" ] || continue
+        plugin_output=$(plugin_status "$plugin")
+        if [ -n "$plugin_output" ]; then
+            printf '%s  ' "$plugin_output"
+        fi
+    done
+}
+
+refresh_mrc_status() {
+    rm -f -- "$PLUGIN_CACHE_DIR/midnight-risk-clock.status" \
+        "$PLUGIN_CACHE_DIR/midnight-risk-clock.stamp"
+    tmux refresh-client -S 2>/dev/null || true
+}
+
+component_order_ids() {
+    local plugin plugin_name component_id
+    local -A available=() seen=()
+
+    for plugin in "$EXTENSION_DIR"/*.tmuxtask; do
+        [ -f "$plugin" ] || continue
+        plugin_name=${plugin##*/}
+        available["plugin:$plugin_name"]=1
+    done
+    available[stats]=1
+    available[clock]=1
+
+    if [ -r "$ORDER_SETTINGS_FILE" ]; then
+        while IFS= read -r component_id; do
+            [ -n "$component_id" ] || continue
+            [ "${available[$component_id]:-0}" = 1 ] || continue
+            [ "${seen[$component_id]:-0}" = 0 ] || continue
+            printf '%s\n' "$component_id"
+            seen["$component_id"]=1
+        done < "$ORDER_SETTINGS_FILE"
+    fi
+
+    for plugin in "$EXTENSION_DIR"/*.tmuxtask; do
+        [ -f "$plugin" ] || continue
+        plugin_name=${plugin##*/}
+        component_id="plugin:$plugin_name"
+        [ "${seen[$component_id]:-0}" = 1 ] && continue
+        printf '%s\n' "$component_id"
+        seen["$component_id"]=1
+    done
+    for component_id in stats clock; do
+        [ "${seen[$component_id]:-0}" = 1 ] && continue
+        printf '%s\n' "$component_id"
+        seen["$component_id"]=1
+    done
+}
+
+component_label() {
+    case "$1" in
+        stats) printf '%s' 'System stats (CPU / RAM / Disk)' ;;
+        clock) printf '%s' 'Clock' ;;
+        plugin:midnight-risk-clock.tmuxtask) printf '%s' 'Midnight Risk Clock' ;;
+        plugin:geopolitical-risk-index.tmuxtask) printf '%s' 'Geopolitical Risk Index (GPR)' ;;
+        plugin:system-updates.tmuxtask) printf '%s' 'System updates' ;;
+        plugin:temperature.tmuxtask) printf '%s' 'Temperature' ;;
+        plugin:uptime.tmuxtask) printf '%s' 'Uptime' ;;
+        plugin:codex-quota.tmuxtask) printf '%s' 'Codex quota (5-hour / weekly)' ;;
+        plugin:network-rates.tmuxtask) printf '%s' 'Network rates' ;;
+        plugin:network-totals.tmuxtask) printf '%s' 'Network totals' ;;
+        plugin:*) printf '%s' "${1#plugin:}" ;;
+    esac
+}
+
+component_position_values() {
+    local component_id="$1" saved_id saved_line saved_align line=1 align=right
+    if [ -r "$POSITION_SETTINGS_FILE" ]; then
+        while IFS=$'\t' read -r saved_id saved_line saved_align; do
+            [ "$saved_id" = "$component_id" ] || continue
+            if [[ "$saved_line" =~ ^[1-4]$ ]]; then
+                line=$((10#$saved_line))
+            fi
+            case "$saved_align" in left|right) align="$saved_align" ;; esac
+            break
+        done < "$POSITION_SETTINGS_FILE"
+    fi
+    printf '%s\t%s\n' "$line" "$align"
+}
+
+component_position_line() {
+    component_position_values "$1" | awk -F '\t' '{ print $1 }'
+}
+
+component_position_alignment() {
+    component_position_values "$1" | awk -F '\t' '{ print $2 }'
+}
+
+write_position_settings() {
+    local target_id="$1" target_line="$2" target_align="$3" line_count component_id line align temp
+    [[ "$target_line" =~ ^[1-4]$ ]] || return 1
+    [ "$target_line" -le "$(extension_line_count)" ] || return 1
+    case "$target_align" in left|right) ;; *) return 1 ;; esac
+    line_count=$(extension_line_count)
+    temp=$(mktemp "$POSITION_SETTINGS_FILE.tmp.XXXXXX")
+    {
+        printf '%s\n' '# Generated by tmux-taskbar.  component<TAB>line<TAB>alignment.'
+        while IFS= read -r component_id; do
+            [ -n "$component_id" ] || continue
+            if [ "$component_id" = "$target_id" ]; then
+                line="$target_line"
+                align="$target_align"
+            else
+                IFS=$'\t' read -r line align < <(component_position_values "$component_id")
+            fi
+            [ "$line" -le "$line_count" ] || line="$line_count"
+            printf '%s\t%s\t%s\n' "$component_id" "$line" "$align"
+        done < <(component_order_ids)
+    } > "$temp"
+    mv -f -- "$temp" "$POSITION_SETTINGS_FILE"
+    tmux refresh-client -S 2>/dev/null || true
+}
+
+normalize_position_settings() {
+    local line_count="$1" component_id line align temp
+    [[ "$line_count" =~ ^[1-4]$ ]] || return 1
+    temp=$(mktemp "$POSITION_SETTINGS_FILE.tmp.XXXXXX")
+    {
+        printf '%s\n' '# Generated by tmux-taskbar.  component<TAB>line<TAB>alignment.'
+        while IFS= read -r component_id; do
+            [ -n "$component_id" ] || continue
+            IFS=$'\t' read -r line align < <(component_position_values "$component_id")
+            [ "$line" -le "$line_count" ] || line="$line_count"
+            printf '%s\t%s\t%s\n' "$component_id" "$line" "$align"
+        done < <(component_order_ids)
+    } > "$temp"
+    mv -f -- "$temp" "$POSITION_SETTINGS_FILE"
+}
+
+row_status_line() {
+    local requested_line="$1" side="$2" status component_id plugin_name component_output row_output='' separator='  ' position line align
+    status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+    [[ "$requested_line" =~ ^[1-4]$ ]] || return 0
+    [[ "$status" =~ ^[2-5]$ ]] || return 0
+    [ "$requested_line" -le "$((status - 1))" ] || return 0
+    [ "$requested_line" -le "$(extension_line_count)" ] || return 0
+    case "$side" in left|right) ;; *) return 0 ;; esac
+    [ "$(extension_spacing_mode)" = compact ] && separator=''
+    while IFS= read -r component_id; do
+        position=$(component_position_values "$component_id")
+        IFS=$'\t' read -r line align <<< "$position"
+        [ "$line" = "$requested_line" ] || continue
+        [ "$align" = "$side" ] || continue
+        case "$component_id" in
+            plugin:*)
+                plugin_name=${component_id#plugin:}
+                component_output=$(plugin_status "$EXTENSION_DIR/$plugin_name")
+                ;;
+            stats)
+                [ "$(component_enabled stats)" = 1 ] || continue
+                component_output=$(status_system_stats)
+                ;;
+            clock)
+                [ "$(component_enabled clock)" = 1 ] || continue
+                component_output=$(status_clock)
+                ;;
+            *) continue ;;
+        esac
+        [ -n "$component_output" ] || continue
+        if [ -n "$row_output" ]; then row_output+="$separator"; fi
+        row_output+="($component_output)"
+    done < <(component_order_ids)
+    printf '%s\n' "$row_output"
+}
+
+row_status_taskbar() {
+    local left_output right_output
+    left_output=$(row_status_line 1 left)
+    right_output=$(row_status_line 1 right)
+    if [ -n "$left_output" ] && [ -n "$right_output" ]; then
+        printf '%s#[align=right]%s\n' "$left_output" "$right_output"
+    elif [ -n "$left_output" ]; then
+        printf '%s\n' "$left_output"
+    elif [ -n "$right_output" ]; then
+        printf '#[align=right]%s\n' "$right_output"
+    else
+        printf '\n'
+    fi
+}
+
+recent_dirs_release_lock() {
+    local lock_dir="$1"
+    rm -f -- "$lock_dir/pid" 2>/dev/null || true
+    rmdir "$lock_dir" 2>/dev/null || true
+}
+
+recent_dirs_record() {
+    local lock_dir lock_pid pane_data pane_format pane_id pane_path canonical previous_path now changed server_signature snapshot_signature pane_count
+    local snapshot_temp history_temp stamp path
+    local -A previous=() changed_dirs=() latest=()
+
+    mkdir -p "$TASKBAR_STATE_DIR" 2>/dev/null || return 0
+    lock_dir="$TASKBAR_STATE_DIR/.recent-dirs.lock"
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        lock_pid=''
+        [ -r "$lock_dir/pid" ] && read -r lock_pid < "$lock_dir/pid" || true
+        if [[ "$lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+            rm -f -- "$lock_dir/pid" 2>/dev/null || true
+            rmdir "$lock_dir" 2>/dev/null || true
+            mkdir "$lock_dir" 2>/dev/null || return 0
+        else
+            return 0
+        fi
+    fi
+    printf '%s\n' "$$" > "$lock_dir/pid" 2>/dev/null || true
+
+    if ! snapshot_temp=$(mktemp "$TASKBAR_STATE_DIR/.recent-pane-dirs.XXXXXX" 2>/dev/null); then
+        recent_dirs_release_lock "$lock_dir"
+        return 0
+    fi
+    printf -v pane_format '#{pane_id}\t#{pane_current_path}'
+    pane_data=$(tmux list-panes -a -F "$pane_format" 2>/dev/null || true)
+    if [ -z "$pane_data" ]; then
+        rm -f -- "$snapshot_temp"
+        recent_dirs_release_lock "$lock_dir"
+        return 0
+    fi
+
+    if [ -r "$RECENT_DIRS_SNAPSHOT_FILE" ]; then
+        while IFS=$'\t' read -r pane_id pane_path; do
+            [ -n "$pane_id" ] || continue
+            if [ "$pane_id" = '@server' ]; then
+                snapshot_signature="$pane_path"
+                continue
+            fi
+            previous["$pane_id"]="$pane_path"
+        done < "$RECENT_DIRS_SNAPSHOT_FILE"
+    fi
+
+    server_signature=$(tmux display-message -p '#{pid}' 2>/dev/null || true)
+    if [ -n "$server_signature" ] && [ "${snapshot_signature:-}" != "$server_signature" ]; then
+        previous=()
+    fi
+    now=$(date +%s)
+    changed=0
+    pane_count=0
+    printf '@server\t%s\n' "$server_signature" > "$snapshot_temp"
+    while IFS=$'\t' read -r pane_id pane_path; do
+        [ -n "$pane_id" ] || continue
+        [ -d "$pane_path" ] || continue
+        canonical=$(readlink -f -- "$pane_path" 2>/dev/null || true)
+        [ -d "$canonical" ] || continue
+        pane_count=$((pane_count + 1))
+        printf '%s\t%s\n' "$pane_id" "$canonical" >> "$snapshot_temp"
+        previous_path="${previous[$pane_id]:-}"
+        if [ "$previous_path" != "$canonical" ]; then
+            changed_dirs["$canonical"]=1
+            changed=1
+        fi
+    done <<< "$pane_data"
+
+    if [ "$pane_count" -eq 0 ]; then
+        rm -f -- "$snapshot_temp"
+        recent_dirs_release_lock "$lock_dir"
+        return 0
+    fi
+
+    if [ "$changed" -eq 1 ]; then
+        if [ -r "$RECENT_DIRS_FILE" ]; then
+            while IFS=$'\t' read -r stamp path; do
+                [[ "$stamp" =~ ^[0-9]+$ ]] || continue
+                [ -n "$path" ] || continue
+                latest["$path"]="$stamp"
+            done < "$RECENT_DIRS_FILE"
+        fi
+        for path in "${!changed_dirs[@]}"; do
+            latest["$path"]="$now"
+        done
+        if history_temp=$(mktemp "$TASKBAR_STATE_DIR/.recent-dirs.XXXXXX" 2>/dev/null); then
+            {
+                for path in "${!latest[@]}"; do
+                    printf '%s\t%s\n' "${latest[$path]}" "$path"
+                done
+            } | LC_ALL=C sort -t $'\t' -k1,1nr | awk -F $'\t' '!seen[$2]++ && count++ < 5 { print }' > "$history_temp"
+            mv -f -- "$history_temp" "$RECENT_DIRS_FILE" 2>/dev/null || rm -f -- "$history_temp"
+        fi
+    fi
+
+    if ! cmp -s "$snapshot_temp" "$RECENT_DIRS_SNAPSHOT_FILE" 2>/dev/null; then
+        mv -f -- "$snapshot_temp" "$RECENT_DIRS_SNAPSHOT_FILE" 2>/dev/null || rm -f -- "$snapshot_temp"
+    else
+        rm -f -- "$snapshot_temp"
+    fi
+    recent_dirs_release_lock "$lock_dir"
+}
+
+recent_dirs_list() {
+    local stamp path
+    local -A seen=()
+    [ -r "$RECENT_DIRS_FILE" ] || return 0
+    while IFS=$'\t' read -r stamp path; do
+        [[ "$stamp" =~ ^[0-9]+$ ]] || continue
+        [ -n "$path" ] || continue
+        [ -d "$path" ] || continue
+        [ "${seen[$path]:-0}" = 0 ] || continue
+        seen["$path"]=1
+        printf '%s\n' "$path"
+    done < "$RECENT_DIRS_FILE"
+}
+
+recent_dir_label() {
+    local path="$1" base display
+    base="${path##*/}"
+    [ -n "$base" ] || base=/
+    display="[$base] $path"
+    if [ "${#display}" -gt 72 ]; then
+        display="[$base] …${path: -60}"
+    fi
+    printf '%s' "$display"
+}
+
+recent_dirs_menu() {
+    local target_pane="${1:-}" path label action index=0 key
+    local -a paths=() menu_args=()
+    [ -n "$target_pane" ] || target_pane=$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)
+    [ -n "$target_pane" ] || return 0
+    mapfile -t paths < <(recent_dirs_list)
+    for path in "${paths[@]}"; do
+        [ -n "$path" ] || continue
+        index=$((index + 1)); key="$index"
+        label=$(recent_dir_label "$path")
+        printf -v action 'run-shell -b %q' "$SCRIPT_PATH --cd-recent-index $index $target_pane"
+        menu_args+=("$label" "$key" "$action")
+        [ "$index" -ge 5 ] && break
+    done
+    if [ "$index" -eq 0 ]; then
+        menu_args+=("-No recent directories" "" "")
+    fi
+    tmux display-menu -O -M -T "Recent directories" -x P -y P "${menu_args[@]}"
+}
+
+recent_dir_change() {
+    local index="$1" target_pane="${2:-}" path command
+    [[ "$index" =~ ^[1-5]$ ]] || return 0
+    path=$(recent_dirs_list | awk -v wanted="$index" 'NR == wanted { print; exit }')
+    [ -d "$path" ] || return 0
+    [ -n "$target_pane" ] || target_pane=$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)
+    if [ -n "$target_pane" ] && ! tmux display-message -p -t "$target_pane" '#{pane_id}' >/dev/null 2>&1; then
+        target_pane=$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)
+    fi
+    [ -n "$target_pane" ] || return 0
+    printf -v command 'cd -- %q' "$path"
+    tmux send-keys -t "$target_pane" "$command" C-m
+}
+
+display_width() { printf '%s' "$1" | wc -L | awk '{ print $1 }'; }
+
+taskbar_session_rows() {
+    # The status format's #{S:...} expansion orders sessions by numeric
+    # session ID. Keep mouse hit-testing in that same order after sessions
+    # are deleted and recreated.
+    tmux list-sessions -F '#{session_id}	#{session_name}' |
+        LC_ALL=C sort -t $'\t' -k1.2,1n
+}
+
+mouse_taskbar() {
+    local status mouse_line mouse_x start_width offset session_id session_name button_width next_offset
+    status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+    case "$status" in 2|3|4|5) ;; *) return 0;; esac
+    mouse_line="${1:-}"; mouse_x="${2:-}"
+    [ -n "$mouse_line" ] || mouse_line=$(tmux display-message -p -F '#{mouse_status_line}' 2>/dev/null || true)
+    [ -n "$mouse_x" ] || mouse_x=$(tmux display-message -p -F '#{mouse_x}' 2>/dev/null || true)
+    # tmux reports status rows zero-based: 0 is the top taskbar row and
+    # 1 through 4 are the configurable extension rows.
+    case "$mouse_line" in 0|1|2|3|4) ;; *) return 0;; esac
+    case "$mouse_x" in ''|*[!0-9]*) return 0;; esac
+    show_start_menu() {
+        local target_pane recent_menu_command
+        target_pane=$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)
+        printf -v recent_menu_command 'run-shell -b %q' "$SCRIPT_PATH --recent-menu $target_pane"
+        tmux display-menu -O -M -C 0 -T "Start" -x P -y P \
+            "New session" n "run-shell -b '$SCRIPT_PATH --start'" \
+            "Recent dir" d "$recent_menu_command" \
+            "Cron" c "display-popup -E -w 90% -h 90% -T 'Cron' '$SCRIPT_PATH --schedules'" \
+            "Themes" t "display-popup -E -w 90% -h 90% -T 'Themes' '$SCRIPT_PATH --themes'" \
+            "Settings" s "display-popup -E -w 64% -h 60% -T 'Taskbar Settings' '$SCRIPT_PATH --settings'" \
+            "Exit tmux-taskbar" x "confirm-before -p 'Return to Bash and leave tmux-taskbar?' { run-shell -b \"$SCRIPT_PATH --exit\" }"
+    }
+    show_session_menu() {
+        local id="$1" name="$2"
+        tmux display-menu -O -M -C 0 -T "Session" -x W -y S \
+            "Switch to" s "switch-client -t '$id'" \
+            "Rename" r "command-prompt -p 'New session name:' \"rename-session -t '$id' '%%'\"" \
+            "Kill" k "confirm-before -p 'Kill session \"$name\"?' { run-shell -b \"$SCRIPT_PATH --kill-session '$id'\" }"
+    }
+    start_width=$(display_width ' Start ')
+    [ "$mouse_x" -lt "$start_width" ] && { show_start_menu; return 0; }
+    offset=$start_width
+    while IFS=$'\t' read -r session_id session_name; do
+        [ -n "$session_id" ] || continue
+        button_width=$(display_width " [ $session_name ]"); next_offset=$((offset+button_width))
+        if [ "$mouse_x" -lt "$next_offset" ]; then show_session_menu "$session_id" "$session_name"; return 0; fi
+        offset=$next_offset
+    done < <(taskbar_session_rows)
+}
+
+save_taskbar_settings() {
+    local settings_file="$1" new_status="$2" health_seconds="$3" clock_mode stat_cpu stat_ram stat_disk stats_minimal stats_pad mrc_display mrc_delta mrc_level mrc_timeout network_device network_show_device extension_spacing extension_lines temp
+    clock_mode="${4:-$(clock_format_mode)}"
+    stat_cpu="${5:-$(system_stat_enabled cpu)}"
+    stat_ram="${6:-$(system_stat_enabled ram)}"
+    stat_disk="${7:-$(system_stat_enabled disk)}"
+    stats_minimal="${8:-$(system_stats_minimal)}"
+    stats_pad="${9:-$(system_stats_pad_percent)}"
+    mrc_display="${10:-$(mrc_display_mode)}"
+    mrc_delta="${11:-$(mrc_show_delta)}"
+    mrc_level="${12:-$(mrc_show_level)}"
+    mrc_timeout="${13:-$(mrc_request_timeout)}"
+    network_device="${16:-$(network_device_setting)}"
+    if [ "$network_device" != auto ] && ! [[ "$network_device" =~ ^[[:alnum:]_.:@+-]+$ ]]; then
+        network_device=auto
+    fi
+    network_show_device="${17:-$(network_device_info_enabled)}"
+    [[ "$network_show_device" =~ ^[01]$ ]] || network_show_device=1
+    extension_spacing="${14:-$(extension_spacing_mode)}"
+    extension_lines="${15:-$(extension_line_count)}"
+    [[ "$extension_lines" =~ ^[1-4]$ ]] || extension_lines="$DEFAULT_EXTENSION_LINES"
+    temp=$(mktemp "$settings_file.tmp.XXXXXX")
+    {
+        printf '%s\n' '# Generated by tmux-taskbar.'
+        printf 'set-option -g status %s\n' "$new_status"
+        printf 'set-option -g @tmux_taskbar_health_interval %s\n' "$health_seconds"
+        printf 'set-option -g @tmux_taskbar_clock_format %s\n' "$clock_mode"
+        printf 'set-option -g @tmux_taskbar_stat_cpu %s\n' "$stat_cpu"
+        printf 'set-option -g @tmux_taskbar_stat_ram %s\n' "$stat_ram"
+        printf 'set-option -g @tmux_taskbar_stat_disk %s\n' "$stat_disk"
+        printf 'set-option -g @tmux_taskbar_stats_minimal %s\n' "$stats_minimal"
+        printf 'set-option -g @tmux_taskbar_stats_pad_percent %s\n' "$stats_pad"
+        printf 'set-option -g @tmux_taskbar_mrc_display %s\n' "$mrc_display"
+        printf 'set-option -g @tmux_taskbar_mrc_delta %s\n' "$mrc_delta"
+        printf 'set-option -g @tmux_taskbar_mrc_level %s\n' "$mrc_level"
+        printf 'set-option -g @tmux_taskbar_mrc_timeout %s\n' "$mrc_timeout"
+        printf 'set-option -g @tmux_taskbar_network_device %s\n' "$network_device"
+        printf 'set-option -g @tmux_taskbar_network_show_device %s\n' "$network_show_device"
+        printf 'set-option -g @tmux_taskbar_extension_spacing %s\n' "$extension_spacing"
+        printf 'set-option -g @tmux_taskbar_extension_lines %s\n' "$extension_lines"
+    } > "$temp"
+    mv -f -- "$temp" "$settings_file"
+    tmux set-option -g status "$new_status"
+    tmux set-option -g @tmux_taskbar_health_interval "$health_seconds"
+    tmux set-option -g @tmux_taskbar_clock_format "$clock_mode"
+    tmux set-option -g @tmux_taskbar_stat_cpu "$stat_cpu"
+    tmux set-option -g @tmux_taskbar_stat_ram "$stat_ram"
+    tmux set-option -g @tmux_taskbar_stat_disk "$stat_disk"
+    tmux set-option -g @tmux_taskbar_stats_minimal "$stats_minimal"
+    tmux set-option -g @tmux_taskbar_stats_pad_percent "$stats_pad"
+    tmux set-option -g @tmux_taskbar_mrc_display "$mrc_display"
+    tmux set-option -g @tmux_taskbar_mrc_delta "$mrc_delta"
+    tmux set-option -g @tmux_taskbar_mrc_level "$mrc_level"
+    tmux set-option -g @tmux_taskbar_mrc_timeout "$mrc_timeout"
+    tmux set-option -g @tmux_taskbar_network_device "$network_device"
+    tmux set-option -g @tmux_taskbar_network_show_device "$network_show_device"
+    tmux set-option -g @tmux_taskbar_extension_spacing "$extension_spacing"
+    tmux set-option -g @tmux_taskbar_extension_lines "$extension_lines"
+    tmux refresh-client -S 2>/dev/null || true
+}
+
+settings_extensions() {
+    local term_lines ui_w ui_h component_id component_label_text state index list_height selection temp enabled selected settings_key
+    local -a component_order=() dialog_items=()
+    local -a selected_ids=()
+    term_lines="$1"
+    ui_w="$2"
+    ui_h="$term_lines"
+
+    mapfile -t component_order < <(component_order_ids)
+    [ "${#component_order[@]}" -gt 0 ] || return 0
+
+    index=0
+    for component_id in "${component_order[@]}"; do
+        state=off
+        [ "$(component_enabled "$component_id")" = 1 ] && state=on
+        component_label_text=$(component_label "$component_id")
+        dialog_items+=("$index" "$component_label_text" "$state")
+        index=$((index + 1))
+    done
+
+    list_height=${#component_order[@]}
+    [ "$list_height" -gt 8 ] && list_height=8
+    selection=$(dialog --title "Extension Settings" --separate-output --checklist \
+        "Select the extensions and built-in items enabled on the extension lines.\n\nUnchecked extensions are not executed; unchecked System stats or Clock are hidden." \
+        "$ui_h" "$ui_w" "$list_height" "${dialog_items[@]}" 3>&1 1>&2 2>&3) || return 0
+
+    while IFS= read -r index; do
+        [ -n "$index" ] && selected_ids+=("$index")
+    done <<< "$selection"
+
+    temp=$(mktemp "$PLUGIN_SETTINGS_FILE.tmp.XXXXXX")
+    printf '%s\n' '# Generated by tmux-taskbar.  1=enabled, 0=disabled.' > "$temp"
+    for index in "${!component_order[@]}"; do
+        enabled=0
+        for selected in "${selected_ids[@]:-}"; do
+            if [ "$selected" = "$index" ]; then
+                enabled=1
+                break
+            fi
+        done
+        settings_key=$(component_settings_key "${component_order[$index]}")
+        printf '%s\t%s\n' "$settings_key" "$enabled" >> "$temp"
+    done
+    mv -f -- "$temp" "$PLUGIN_SETTINGS_FILE"
+    tmux refresh-client -S 2>/dev/null || true
+}
+
+settings_clock() {
+    local term_lines ui_w ui_h selection new_mode status health_seconds
+    term_lines="$1"
+    ui_w="$2"
+    ui_h="$term_lines"
+    selection=$(dialog --title "Clock Settings" --menu \
+        "Choose the clock format." "$ui_h" "$ui_w" 2 \
+        24 "24-hour (21:45)" \
+        12 "AM/PM (09:45 PM)" 3>&1 1>&2 2>&3) || return 0
+    case "$selection" in 24|12) new_mode="$selection" ;; *) return 0 ;; esac
+    status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+    health_seconds=$(health_interval_seconds)
+    save_taskbar_settings "$INSTALL_HOME/.tmux-taskbar.conf" "$status" "$health_seconds" "$new_mode"
+}
+
+settings_system_stats() {
+    local term_lines ui_w ui_h selection stat_cpu stat_ram stat_disk stats_minimal stats_pad index status health_seconds clock_mode state
+    local -a dialog_items=()
+    term_lines="$1"
+    ui_w="$2"
+    ui_h="$term_lines"
+    stat_cpu=$(system_stat_enabled cpu)
+    stat_ram=$(system_stat_enabled ram)
+    stat_disk=$(system_stat_enabled disk)
+    stats_minimal=$(system_stats_minimal)
+    stats_pad=$(system_stats_pad_percent)
+    dialog_items=(
+        cpu "CPU usage" "$([ "$stat_cpu" = 1 ] && printf on || printf off)"
+        ram "RAM usage" "$([ "$stat_ram" = 1 ] && printf on || printf off)"
+        disk "Disk free space" "$([ "$stat_disk" = 1 ] && printf on || printf off)"
+        minimal "Minimal format (C:0%/R:0%/D:50G)" "$([ "$stats_minimal" = 1 ] && printf on || printf off)"
+        pad "Pad percentages (001% format)" "$([ "$stats_pad" = 1 ] && printf on || printf off)"
+    )
+    selection=$(dialog --title "System Stats Settings" --separate-output --checklist \
+        "Select the statistics shown in the System stats item and choose its format." \
+        "$ui_h" "$ui_w" 5 "${dialog_items[@]}" 3>&1 1>&2 2>&3) || return 0
+    stat_cpu=0; stat_ram=0; stat_disk=0; stats_minimal=0; stats_pad=0
+    while IFS= read -r index; do
+        case "$index" in
+            cpu) stat_cpu=1 ;;
+            ram) stat_ram=1 ;;
+            disk) stat_disk=1 ;;
+            minimal) stats_minimal=1 ;;
+            pad) stats_pad=1 ;;
+        esac
+    done <<< "$selection"
+    status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+    health_seconds=$(health_interval_seconds)
+    clock_mode=$(clock_format_mode)
+    save_taskbar_settings "$INSTALL_HOME/.tmux-taskbar.conf" "$status" "$health_seconds" "$clock_mode" "$stat_cpu" "$stat_ram" "$stat_disk" "$stats_minimal" "$stats_pad"
+}
+
+settings_extension_interval() {
+    local term_lines ui_w ui_h health_seconds health_minutes health_input status
+    term_lines="$1"
+    ui_w="$2"
+    ui_h="$term_lines"
+    health_seconds=$(health_interval_seconds)
+    health_minutes=$(( (health_seconds + 59) / 60 ))
+    health_input=$(dialog --title "Extension Refresh" --inputbox \
+        "Run enabled .tmuxtask extensions every how many minutes?\n\nDefault: 5 minutes" \
+        "$ui_h" "$ui_w" "$health_minutes" 3>&1 1>&2 2>&3) || return 0
+    [[ "$health_input" =~ ^[1-9][0-9]*$ ]] || { printf '%s\n' 'Extension interval must be a positive number of minutes.' >&2; return 0; }
+    health_seconds=$((10#$health_input * 60))
+    status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+    save_taskbar_settings "$INSTALL_HOME/.tmux-taskbar.conf" "$status" "$health_seconds"
+}
+
+settings_network_device() {
+    local term_lines="$1" ui_w="$2" ui_h current_device selection new_device status health_seconds
+    local interface_path interface_name interface_label list_height current_found=0
+    local -a menu_items=(auto "Automatic (default route)")
+
+    ui_h="$term_lines"
+    current_device=$(network_device_setting)
+    [ "$current_device" = auto ] && current_found=1
+    for interface_path in /sys/class/net/*; do
+        [ -e "$interface_path" ] || continue
+        interface_name=${interface_path##*/}
+        [[ "$interface_name" =~ ^[[:alnum:]_.:@+-]+$ ]] || continue
+        [ "$interface_name" = "$current_device" ] && current_found=1
+        interface_label="$interface_name"
+        [ "$interface_name" = "$current_device" ] && interface_label+=' (current)'
+        menu_items+=("$interface_name" "$interface_label")
+    done
+    [ "$current_found" = 1 ] || current_device=auto
+    if [ "$current_device" = auto ]; then
+        menu_items[1]='Automatic (default route) (current)'
+    fi
+
+    list_height=$(( ${#menu_items[@]} / 2 ))
+    [ "$list_height" -gt 10 ] && list_height=10
+    selection=$(dialog --default-item "$current_device" --title "Network Rates" --menu \
+        "Choose the networking device whose receive and transmit rates are displayed." \
+        "$ui_h" "$ui_w" "$list_height" "${menu_items[@]}" 3>&1 1>&2 2>&3) || return 0
+    new_device="$selection"
+    [ "$new_device" = auto ] || [[ "$new_device" =~ ^[[:alnum:]_.:@+-]+$ ]] || return 0
+    tmux set-option -g @tmux_taskbar_network_device "$new_device"
+    status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+    health_seconds=$(health_interval_seconds)
+    save_taskbar_settings "$INSTALL_HOME/.tmux-taskbar.conf" "$status" "$health_seconds"
+    rm -f -- "$PLUGIN_CACHE_DIR/network-rates.status" "$PLUGIN_CACHE_DIR/network-rates.stamp" \
+        "$TASKBAR_STATE_DIR/network-rates.state"
+    tmux refresh-client -S 2>/dev/null || true
+}
+
+settings_network_rates() {
+    local term_lines="$1" ui_w="$2" ui_h selection current_visibility visibility_label status health_seconds
+    term_lines="$1"
+    ui_w="$2"
+    ui_h="$term_lines"
+    while :; do
+        current_visibility=$(network_device_info_enabled)
+        [ "$current_visibility" = 1 ] && visibility_label='on' || visibility_label='off'
+        selection=$(dialog --title "Network Extensions" --menu \
+            "Configure the shared Network Rates and Network Totals settings." "$ui_h" "$ui_w" 2 \
+            device "Monitored networking device" \
+            visibility "Show device name ($visibility_label)" 3>&1 1>&2 2>&3) || return 0
+        case "$selection" in
+            device) settings_network_device "$term_lines" "$ui_w" ;;
+            visibility)
+                selection=$(dialog --title "Network Device Name" --menu \
+                    "Show the monitored device name in both networking extensions?" "$ui_h" "$ui_w" 2 \
+                    1 "Show device name" \
+                    0 "Hide device name (compact)" 3>&1 1>&2 2>&3) || continue
+                [[ "$selection" =~ ^[01]$ ]] || continue
+                tmux set-option -g @tmux_taskbar_network_show_device "$selection"
+                status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+                health_seconds=$(health_interval_seconds)
+                save_taskbar_settings "$INSTALL_HOME/.tmux-taskbar.conf" "$status" "$health_seconds"
+                tmux refresh-client -S 2>/dev/null || true
+                ;;
+        esac
+    done
+}
+
+settings_midnight_risk_clock_help() {
+    local term_lines="$1" ui_w="$2"
+    dialog --title "Midnight Risk Clock Help" --msgbox \
+        "The ranges below are an illustrative intensity guide, not official historical MRC backtests.\n\n0-24  STABLE\nRoutine, comparatively calm conditions.\n\n25-49  TENSIONS\nDiplomatic or military friction; examples of this kind of period include the 1973 Yom Kippur War or the 1990 Kuwait crisis.\n\n50-74  PRESSURE\nA major crisis with broad political or economic effects; examples include the 1991 Gulf War or the 2003 Iraq invasion.\n\n75-89  VOLATILE\nAn exceptional international shock, such as the Cuban Missile Crisis or the aftermath of 9/11.\n\n90-97  CRISIS\nA historically extreme shock, such as the attack on Pearl Harbor or the opening of World War I.\n\n98-99  PRE-BREAKPOINT\nConditions approaching the clock's maximum-risk boundary.\n\n100  THRESHOLD\nThe maximum value on this display; it does not predict an outcome." \
+        "$term_lines" "$ui_w"
+}
+
+settings_geopolitical_risk_index_help() {
+    local term_lines="$1" ui_w="$2"
+    dialog --title "Geopolitical Risk Index Help" --msgbox \
+        "GPR is normalized here against the highest historical GPRH reading observed during 1939-1945, so WWII-scale readings map near 100. Examples are approximate and may shift when GPR data are revised.\n\n0-24\nQuieter baseline months; this does not mean zero geopolitical risk.\n\n25-49\nElevated or regional crises: Yom Kippur War (about 33) and the Cuban Missile Crisis (about 47).\n\n50-74\nMajor international crises: Gulf War (about 52), 9/11 (about 60), and the 2003 Iraq War (about 51).\n\n75-89\nVery rare, extreme months below the historical WWII-era upper tail; no single event is a fixed boundary for this band.\n\n90-100\nWorld-war-scale territory: Pearl Harbor was about 92, WWI's opening was about 98, and the start of WWII defines 100 in this extension.\n\nThese comparisons are context aids, not forecasts or official GPR categories." \
+        "$term_lines" "$ui_w"
+}
+
+settings_midnight_risk_clock() {
+    local term_lines ui_w ui_h selection display_mode delta level timeout timeout_input status health_seconds
+    term_lines="$1"
+    ui_w="$2"
+    ui_h="$term_lines"
+    while :; do
+        selection=$(dialog --title "Midnight Risk Clock" --menu \
+            "Configure the Midnight Risk Clock extension." "$ui_h" "$ui_w" 5 \
+            display "Display mode" \
+            delta "Weekly change" \
+            level "Risk level" \
+            timeout "Network timeout" \
+            refresh "Refresh interval (all extensions)" \
+            help "Historical range examples" 3>&1 1>&2 2>&3) || return 0
+        case "$selection" in
+            display)
+                display_mode=$(mrc_display_mode)
+                selection=$(dialog --title "Midnight Risk Clock Display" --menu \
+                    "Choose what the extension displays." "$ui_h" "$ui_w" 3 \
+                    both "Clock and score (MRC:8:31 PM 71.0/100)" \
+                    clock "Clock only (MRC:8:31 PM)" \
+                    score "Score only (MRC:71.0/100)" 3>&1 1>&2 2>&3) || continue
+                case "$selection" in both|clock|score) display_mode="$selection" ;; *) continue ;; esac
+                tmux set-option -g @tmux_taskbar_mrc_display "$display_mode"
+                status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+                health_seconds=$(health_interval_seconds)
+                save_taskbar_settings "$INSTALL_HOME/.tmux-taskbar.conf" "$status" "$health_seconds"
+                refresh_mrc_status
+                ;;
+            delta)
+                selection=$(dialog --title "Midnight Risk Clock Weekly Change" --menu \
+                    "Show the weekly score change after the reading?" "$ui_h" "$ui_w" 2 \
+                    1 "Show weekly change" \
+                    0 "Hide weekly change" 3>&1 1>&2 2>&3) || continue
+                case "$selection" in 1|0) delta="$selection" ;; *) continue ;; esac
+                tmux set-option -g @tmux_taskbar_mrc_delta "$delta"
+                status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+                health_seconds=$(health_interval_seconds)
+                save_taskbar_settings "$INSTALL_HOME/.tmux-taskbar.conf" "$status" "$health_seconds"
+                refresh_mrc_status
+                ;;
+            level)
+                selection=$(dialog --title "Midnight Risk Clock Risk Level" --menu \
+                    "Show the text risk level with the score?" "$ui_h" "$ui_w" 2 \
+                    1 "Show risk level" \
+                    0 "Hide risk level" 3>&1 1>&2 2>&3) || continue
+                case "$selection" in 1|0) level="$selection" ;; *) continue ;; esac
+                tmux set-option -g @tmux_taskbar_mrc_level "$level"
+                status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+                health_seconds=$(health_interval_seconds)
+                save_taskbar_settings "$INSTALL_HOME/.tmux-taskbar.conf" "$status" "$health_seconds"
+                refresh_mrc_status
+                ;;
+            timeout)
+                timeout=$(mrc_request_timeout)
+                timeout_input=$(dialog --title "Midnight Risk Clock Network Timeout" --inputbox \
+                    "How many seconds should the request wait before showing unavailable?\n\nAllowed: 1–30 seconds. Default: 5" \
+                    "$ui_h" "$ui_w" "$timeout" 3>&1 1>&2 2>&3) || continue
+                [[ "$timeout_input" =~ ^[1-9][0-9]*$ ]] && [ "$timeout_input" -le 30 ] || { printf '%s\n' 'Midnight Risk Clock timeout must be 1–30 seconds.' >&2; continue; }
+                tmux set-option -g @tmux_taskbar_mrc_timeout "$((10#$timeout_input))"
+                status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+                health_seconds=$(health_interval_seconds)
+                save_taskbar_settings "$INSTALL_HOME/.tmux-taskbar.conf" "$status" "$health_seconds"
+                refresh_mrc_status
+                ;;
+            refresh) settings_extension_interval "$term_lines" "$ui_w" ;;
+            help) settings_midnight_risk_clock_help "$term_lines" "$ui_w" ;;
+        esac
+    done
+}
+
+settings_extension_line_count() {
+    local term_lines="$1" ui_w="$2" settings_file="$INSTALL_HOME/.tmux-taskbar.conf"
+    local current_count selection new_count status health_seconds
+    current_count=$(extension_line_count)
+    selection=$(dialog --default-item "$current_count" --title "Extension Line Count" --menu \
+        "Choose how many extension lines appear below the top taskbar line." "$term_lines" "$ui_w" 4 \
+        1 "1 extension line" \
+        2 "2 extension lines" \
+        3 "3 extension lines" \
+        4 "4 extension lines" 3>&1 1>&2 2>&3) || return 0
+    [[ "$selection" =~ ^[1-4]$ ]] || return 0
+    new_count=$((10#$selection))
+    tmux set-option -g @tmux_taskbar_extension_lines "$new_count"
+    normalize_position_settings "$new_count"
+    status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+    if [[ "$status" =~ ^[2-5]$ ]]; then
+        status=$((new_count + 1))
+    else
+        status=on
+    fi
+    health_seconds=$(health_interval_seconds)
+    save_taskbar_settings "$settings_file" "$status" "$health_seconds"
+}
+
+settings_extension_positions() {
+    local term_lines="$1" ui_w="$2" ui_h component_id component_label_text selection action alignment_selection line_selection
+    local current_line current_alignment max_line index
+    local -a component_order=() dialog_items=() line_items=()
+    mapfile -t component_order < <(component_order_ids)
+    [ "${#component_order[@]}" -gt 0 ] || return 0
+    ui_h="$term_lines"
+    max_line=$(extension_line_count)
+    for index in $(seq 1 "$max_line"); do
+        line_items+=("$index" "Extension line $index")
+    done
+    while :; do
+        dialog_items=()
+        for index in "${!component_order[@]}"; do
+            component_id="${component_order[$index]}"
+            component_label_text=$(component_label "$component_id")
+            current_line=$(component_position_line "$component_id")
+            current_alignment=$(component_position_alignment "$component_id")
+            dialog_items+=("$index" "$component_label_text [line $current_line, $current_alignment]")
+        done
+        selection=$(dialog --title "Extension Positions" --menu \
+            "Choose an extension or built-in item to position." "$ui_h" "$ui_w" "${#component_order[@]}" \
+            "${dialog_items[@]}" 3>&1 1>&2 2>&3) || return 0
+        [[ "$selection" =~ ^[0-9]+$ ]] || continue
+        index=$((10#$selection))
+        [ "$index" -lt "${#component_order[@]}" ] || continue
+        component_id="${component_order[$index]}"
+        component_label_text=$(component_label "$component_id")
+        current_line=$(component_position_line "$component_id")
+        current_alignment=$(component_position_alignment "$component_id")
+        action=$(dialog --default-item alignment --title "$component_label_text Position" --menu \
+            "Choose what to change." "$ui_h" "$ui_w" 3 \
+            alignment "Alignment ($current_alignment)" \
+            line "Extension line ($current_line)" \
+            done "Done" 3>&1 1>&2 2>&3) || continue
+        case "$action" in
+            alignment)
+                alignment_selection=$(dialog --default-item "$current_alignment" --title "$component_label_text Alignment" --menu \
+                    "Choose the side of the extension line." "$ui_h" "$ui_w" 2 \
+                    left "Align left" \
+                    right "Align right" 3>&1 1>&2 2>&3) || continue
+                case "$alignment_selection" in
+                    left|right) write_position_settings "$component_id" "$current_line" "$alignment_selection" ;;
+                esac
+                ;;
+            line)
+                line_selection=$(dialog --default-item "$current_line" --title "$component_label_text Extension Line" --menu \
+                    "Choose the extension line." "$ui_h" "$ui_w" "$max_line" \
+                    "${line_items[@]}" 3>&1 1>&2 2>&3) || continue
+                [[ "$line_selection" =~ ^[1-4]$ ]] || continue
+                write_position_settings "$component_id" "$((10#$line_selection))" "$current_alignment"
+                ;;
+            done) return 0 ;;
+        esac
+    done
+}
+
+settings_extension_settings() {
+    local term_lines ui_w ui_h selection health_seconds health_minutes health_input status
+    term_lines="$1"
+    ui_w="$2"
+    ui_h="$term_lines"
+    while :; do
+        selection=$(dialog --title "Extension Settings" --menu \
+            "Configure extensions and the built-in extension-line items." "$ui_h" "$ui_w" 7 \
+            enable "Enable or disable items" \
+            interval "Extension refresh interval" \
+            clock "Clock format" \
+            stats "System stat fields" \
+            mrc "Midnight Risk Clock settings" \
+            gpr "Geopolitical Risk Index help" \
+            network "Network rates settings" 3>&1 1>&2 2>&3) || return 0
+        case "$selection" in
+            enable) settings_extensions "$term_lines" "$ui_w" ;;
+            interval) settings_extension_interval "$term_lines" "$ui_w" ;;
+            clock) settings_clock "$term_lines" "$ui_w" ;;
+            stats) settings_system_stats "$term_lines" "$ui_w" ;;
+            mrc) settings_midnight_risk_clock "$term_lines" "$ui_w" ;;
+            gpr) settings_geopolitical_risk_index_help "$term_lines" "$ui_w" ;;
+            network) settings_network_rates "$term_lines" "$ui_w" ;;
+        esac
+    done
+}
+
+settings_order() {
+    local term_lines ui_w ui_h component_id component_label_text selection action selected_index list_height temp index
+    local -a component_order=() dialog_items=()
+    term_lines="$1"
+    ui_w="$2"
+    ui_h="$term_lines"
+    mapfile -t component_order < <(component_order_ids)
+    [ "${#component_order[@]}" -gt 0 ] || return 0
+
+    list_height=${#component_order[@]}
+    [ "$list_height" -gt 10 ] && list_height=10
+    while :; do
+        dialog_items=()
+        for index in "${!component_order[@]}"; do
+            component_label_text=$(component_label "${component_order[$index]}")
+            dialog_items+=("$index" "$((index + 1)). $component_label_text")
+        done
+
+        selection=$(dialog --title "Global Extension Order" --menu \
+            "Select an item to move.  This order is used within each line and side." \
+            "$ui_h" "$ui_w" "$list_height" "${dialog_items[@]}" 3>&1 1>&2 2>&3) || return 0
+        [[ "$selection" =~ ^[0-9]+$ ]] || continue
+        selected_index=$((10#$selection))
+        [ "$selected_index" -lt "${#component_order[@]}" ] || continue
+        component_label_text=$(component_label "${component_order[$selected_index]}")
+
+        action=$(dialog --title "Global Extension Order" --menu \
+            "Selected: $component_label_text" "$ui_h" "$ui_w" 3 \
+            up "Move up" \
+            down "Move down" \
+            done "Save and close" 3>&1 1>&2 2>&3) || continue
+        case "$action" in
+            up)
+                if [ "$selected_index" -gt 0 ]; then
+                    component_id="${component_order[$selected_index - 1]}"
+                    component_order[$selected_index - 1]="${component_order[$selected_index]}"
+                    component_order[$selected_index]="$component_id"
+                    selected_index=$((selected_index - 1))
+                fi
+                ;;
+            down)
+                if [ "$selected_index" -lt $((${#component_order[@]} - 1)) ]; then
+                    component_id="${component_order[$selected_index + 1]}"
+                    component_order[$selected_index + 1]="${component_order[$selected_index]}"
+                    component_order[$selected_index]="$component_id"
+                    selected_index=$((selected_index + 1))
+                fi
+                ;;
+            done)
+                temp=$(mktemp "$ORDER_SETTINGS_FILE.tmp.XXXXXX")
+                printf '%s\n' '# Generated by tmux-taskbar.  One component per line.' > "$temp"
+                printf '%s\n' "${component_order[@]}" >> "$temp"
+                mv -f -- "$temp" "$ORDER_SETTINGS_FILE"
+                tmux refresh-client -S 2>/dev/null || true
+                return 0
+                ;;
+        esac
+    done
+}
+
+settings_extension_spacing() {
+    local term_lines ui_w ui_h current_mode selection new_mode status health_seconds
+    term_lines="$1"
+    ui_w="$2"
+    ui_h="$term_lines"
+    current_mode=$(extension_spacing_mode)
+    selection=$(dialog --default-item "$current_mode" --title "Extension Spacing" --menu \
+        "Choose how items are separated within each extension line." "$ui_h" "$ui_w" 2 \
+        wide "Separated: (A)  (B)" \
+        compact "Compact: (A)(B)" 3>&1 1>&2 2>&3) || return 0
+    case "$selection" in wide|compact) new_mode="$selection" ;; *) return 0 ;; esac
+    tmux set-option -g @tmux_taskbar_extension_spacing "$new_mode"
+    status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+    health_seconds=$(health_interval_seconds)
+    save_taskbar_settings "$INSTALL_HOME/.tmux-taskbar.conf" "$status" "$health_seconds"
+}
+
+settings_taskbar() {
+    local settings_file="$INSTALL_HOME/.tmux-taskbar.conf" term_cols term_lines ui_w ui_h status current_state selection new_status layout_selection
+    [ -n "${TMUX:-}" ] || { printf '%s\n' 'Taskbar settings must be opened from inside tmux.' >&2; exit 1; }
+    command -v dialog >/dev/null 2>&1 || { printf '%s\n' "Error: dialog is not installed. Install the 'dialog' package." >&2; exit 1; }
+    term_cols=$(tput cols 2>/dev/null || printf '80'); term_lines=$(tput lines 2>/dev/null || printf '24')
+    ui_w=$term_cols; ui_h=$term_lines; [ "$ui_w" -gt 64 ] && ui_w=64; [ "$ui_h" -gt 24 ] && ui_h=24; [ "$ui_w" -lt 42 ] && ui_w=42; [ "$ui_h" -lt 10 ] && ui_h=10
+    while :; do
+        selection=$(dialog --title "Taskbar Settings" --menu \
+            "Choose a setting to change." "$ui_h" "$ui_w" 4 \
+            layout "Taskbar layout" \
+            extensions "Extension settings" \
+            order "Global extension order" \
+            positions "Extension positions" 3>&1 1>&2 2>&3) || return 0
+
+        case "$selection" in
+            layout)
+                layout_selection=$(dialog --title "Taskbar Layout" --menu \
+                    "Choose a taskbar layout setting." "$ui_h" "$ui_w" 3 \
+                    mode "Extension taskbar enabled" \
+                    lines "Extension line count" \
+                    spacing "Extension spacing" 3>&1 1>&2 2>&3) || continue
+                case "$layout_selection" in
+                    mode)
+                        status=$(tmux show-options -gqv status 2>/dev/null || printf 'on')
+                        [[ "$status" =~ ^[2-5]$ ]] && current_state=on || current_state=off
+                        selection=$(dialog --title "Taskbar Layout" --separate-output --checklist \
+                            "Choose the taskbar layout.\n\nThe extension taskbar makes Start and session buttons taller and shows the configured extension lines below them." \
+                            "$ui_h" "$ui_w" 1 1 "Extension taskbar" "$current_state" 3>&1 1>&2 2>&3) || continue
+                        if [ "$selection" = 1 ]; then
+                            new_status=$(( $(extension_line_count) + 1 ))
+                        else
+                            new_status=on
+                        fi
+                        health_seconds=$(tmux show-options -gqv @tmux_taskbar_health_interval 2>/dev/null || true)
+                        [[ "$health_seconds" =~ ^[1-9][0-9]*$ ]] || health_seconds=$DEFAULT_HEALTH_INTERVAL
+                        save_taskbar_settings "$settings_file" "$new_status" "$health_seconds"
+                        ;;
+                    lines) settings_extension_line_count "$term_lines" "$ui_w" ;;
+                    spacing) settings_extension_spacing "$term_lines" "$ui_w" ;;
+                esac
+                ;;
+            extensions)
+                settings_extension_settings "$term_lines" "$ui_w"
+                ;;
+            order)
+                settings_order "$term_lines" "$ui_w"
+                ;;
+            positions)
+                settings_extension_positions "$term_lines" "$ui_w"
+                ;;
+        esac
+    done
+}
+
+run_embedded() {
+    local component="$1" tmp marker rc=0; shift
+    case "$component" in theme) marker=THEME ;; cron) marker=CRON ;; *) return 2;; esac
+    tmp=$(mktemp)
+    awk -v start="__TMUX_TASKBAR_${marker}_PAYLOAD_V1__" -v end="__END_TMUX_TASKBAR_${marker}_PAYLOAD_V1__" '$0==start {inside=1; next} $0==end {inside=0} inside' "$SCRIPT_PATH" | base64 -d | gzip -d > "$tmp"
+    if [ "$marker" = CRON ]; then
+        # The embedded scheduler stores its schedules, worker state, and logs
+        # beneath XDG_CONFIG_HOME/user-tmux. Point that root into the local
+        # extension data directory so generated .log files stay with the
+        # extensions rather than in the user's global config directory.
+        TMUX_TASKBAR_SCRIPT_PATH="$SCRIPT_PATH" XDG_CONFIG_HOME="$EXTENSION_DIR" bash "$tmp" "$@" || rc=$?
+    else
+        TMUX_TASKBAR_SCRIPT_PATH="$SCRIPT_PATH" bash "$tmp" "$@" || rc=$?
+    fi
+    rm -f -- "$tmp"
+    return "$rc"
+}
+
+usage() {
+    printf '%s\n' 'Usage: tmux-taskbar [--install|--uninstall|--start|--exit|--settings|--themes|--schedules|--status]'
+}
+
+case "${1:-}" in
+    "") install_taskbar; start_taskbar ;;
+    --install|install) install_taskbar ;;
+    --uninstall|uninstall) require_tmux; uninstall_taskbar ;;
+    --start|start) start_taskbar ;;
+    --exit|exit) exit_taskbar ;;
+    --config) generate_config ;;
+    --status) status_taskbar ;;
+    --row-status) row_status_taskbar ;;
+    --row-status-line) shift; row_status_line "${1:-}" "${2:-}" ;;
+    --record-dirs) require_tmux; recent_dirs_record ;;
+    --recent-menu) require_tmux; shift; recent_dirs_menu "${1:-}" ;;
+    --cd-recent-index) require_tmux; shift; recent_dir_change "${1:-}" "${2:-}" ;;
+    --mouse) shift; mouse_taskbar "$@" ;;
+    --kill-session) shift; kill_session "$@" ;;
+    --settings) require_tmux; settings_taskbar ;;
+    --themes) require_tmux; run_embedded theme "$@" ;;
+    --schedules|--timers|--alarms) require_tmux; run_embedded cron "$@" ;;
+    --schedule-worker) require_tmux; run_embedded cron "$@" ;;
+    --help|-h) usage ;;
+    *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
+
+exit 0
+
+__TMUX_TASKBAR_THEME_PAYLOAD_V1__
+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
+__END_TMUX_TASKBAR_THEME_PAYLOAD_V1__
+
+__TMUX_TASKBAR_CRON_PAYLOAD_V1__
+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
+__END_TMUX_TASKBAR_CRON_PAYLOAD_V1__

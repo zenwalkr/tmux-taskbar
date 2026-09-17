@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+
+# tmux-taskbar extension: show cumulative receive and transmit totals for one
+# interface.  Linux maintains these counters in sysfs, so they require no
+# sampling state or background service.  They normally cover traffic since
+# boot, but reset when the interface or system is restarted.
+
+set -u
+
+tmux_option() {
+    local option="$1" default_value="$2" value
+    value=$(tmux show-options -gqv "$option" 2>/dev/null || true)
+    [ -n "$value" ] && printf '%s' "$value" || printf '%s' "$default_value"
+}
+
+valid_device_name() {
+    [[ "$1" =~ ^[[:alnum:]_.:@+-]+$ ]]
+}
+
+configured_device=$(tmux_option @tmux_taskbar_network_device auto)
+show_device=$(tmux_option @tmux_taskbar_network_show_device 1)
+if [ "$configured_device" != auto ] && ! valid_device_name "$configured_device"; then
+    configured_device=auto
+fi
+
+device="$configured_device"
+if [ "$device" = auto ]; then
+    # Prefer the interface selected by the default route, then an active
+    # physical or wireless interface, then any non-loopback interface.
+    if command -v ip >/dev/null 2>&1; then
+        route_device=$(ip route get 1.1.1.1 2>/dev/null | awk '
+            { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }
+        ')
+        if valid_device_name "${route_device:-}" && [ -d "/sys/class/net/$route_device" ]; then
+            device="$route_device"
+        fi
+    fi
+    if [ "$device" = auto ]; then
+        fallback_device=''
+        for interface_path in /sys/class/net/*; do
+            [ -e "$interface_path" ] || continue
+            interface_name=${interface_path##*/}
+            [ "$interface_name" = lo ] && continue
+            if valid_device_name "$interface_name"; then
+                [ -n "$fallback_device" ] || fallback_device="$interface_name"
+                if [ -e "$interface_path/device" ] && [ -r "$interface_path/operstate" ] && \
+                   [ "$(<"$interface_path/operstate")" = up ]; then
+                    device="$interface_name"
+                    break
+                fi
+            fi
+        done
+        [ "$device" = auto ] && device="${fallback_device:-auto}"
+    fi
+fi
+
+format_status() {
+    local input_total="$1" output_total="$2"
+    if [ "$show_device" = 1 ]; then
+        if [ "$device" = auto ]; then
+            printf 'NET-T:-- ↓%s ↑%s\n' "$input_total" "$output_total"
+        else
+            printf 'NET-T:%s ↓%s ↑%s\n' "$device" "$input_total" "$output_total"
+        fi
+    else
+        printf '↓%s↑%s\n' "$input_total" "$output_total"
+    fi
+}
+
+format_total() {
+    local bytes="$1"
+    [ "$bytes" = -- ] && { printf '%s' --; return; }
+    awk -v bytes="$bytes" 'BEGIN {
+        if (bytes < 1000) printf "%.0fB", bytes
+        else if (bytes < 1000000) printf "%.1fKB", bytes / 1000
+        else if (bytes < 1000000000) printf "%.1fMB", bytes / 1000000
+        else if (bytes < 1000000000000) printf "%.2fGB", bytes / 1000000000
+        else printf "%.2fTB", bytes / 1000000000000
+    }'
+}
+
+if [ "$device" = auto ]; then
+    format_status -- --
+    exit 0
+fi
+
+rx_file="/sys/class/net/$device/statistics/rx_bytes"
+tx_file="/sys/class/net/$device/statistics/tx_bytes"
+if [ ! -r "$rx_file" ] || [ ! -r "$tx_file" ]; then
+    format_status -- --
+    exit 0
+fi
+
+rx_bytes=$(<"$rx_file")
+tx_bytes=$(<"$tx_file")
+if ! [[ "$rx_bytes" =~ ^[0-9]+$ ]] || ! [[ "$tx_bytes" =~ ^[0-9]+$ ]]; then
+    format_status -- --
+    exit 0
+fi
+
+format_status "$(format_total "$rx_bytes")" "$(format_total "$tx_bytes")"

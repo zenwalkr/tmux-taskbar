@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+# tmux-taskbar extension: show remaining Codex plan allowance.
+#
+# The Codex CLI's authenticated account endpoint reports a rolling 5-hour
+# window and a weekly window.  We use the access token already stored by the
+# CLI at ~/.codex/auth.json, only in memory, and never write it to the cache
+# or taskbar.  Percentages shown here are remaining allowance, not used.
+
+set -u
+
+CODEX_AUTH_FILE="${CODEX_AUTH_FILE:-${HOME:-}/.codex/auth.json}"
+CODEX_USAGE_URL="${CODEX_USAGE_URL:-https://chatgpt.com/backend-api/wham/usage}"
+
+if [ ! -r "$CODEX_AUTH_FILE" ] || ! command -v curl >/dev/null 2>&1; then
+    printf 'CODEX:5H--%% W--%%\n'
+    exit 0
+fi
+
+# access_token is a JWT, so this small fallback parser avoids making jq a
+# requirement.  jq is preferred when available for proper JSON handling.
+if command -v jq >/dev/null 2>&1; then
+    access_token=$(jq -r '.tokens.access_token // empty' "$CODEX_AUTH_FILE" 2>/dev/null || true)
+else
+    access_token=$(sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CODEX_AUTH_FILE" | sed -n '1p')
+fi
+
+[ -n "$access_token" ] || {
+    printf 'CODEX:5H--%% W--%%\n'
+    exit 0
+}
+
+# Feed headers through stdin so the bearer token does not appear in the curl
+# process arguments while the request is running.
+response=$(printf 'Authorization: Bearer %s\nAccept: application/json\n' "$access_token" | \
+    curl --fail --silent --show-error --location --max-time 8 \
+    -H @- "$CODEX_USAGE_URL" 2>/dev/null || true)
+
+if command -v jq >/dev/null 2>&1; then
+    used_5h=$(printf '%s' "$response" | jq -r '.rate_limit.primary_window.used_percent // empty' 2>/dev/null || true)
+    used_week=$(printf '%s' "$response" | jq -r '.rate_limit.secondary_window.used_percent // empty' 2>/dev/null || true)
+else
+    # The endpoint returns compact JSON.  Keep this fallback deliberately
+    # conservative: it only accepts the expected integer used_percent fields.
+    windows=$(printf '%s' "$response" | tr '{}' '\n')
+    used_5h=$(printf '%s\n' "$windows" | sed -n 's/.*"primary_window"[^}]*"used_percent"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | sed -n '1p')
+    used_week=$(printf '%s\n' "$windows" | sed -n 's/.*"secondary_window"[^}]*"used_percent"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | sed -n '1p')
+fi
+
+remaining() {
+    case "$1" in
+        ''|*[!0-9]*) printf '%s' -- ;;
+        *)
+            if [ "$1" -gt 100 ]; then
+                printf '%s' 0
+            else
+                printf '%s' $((100 - 1 * "$1"))
+            fi
+            ;;
+    esac
+}
+
+remaining_5h=$(remaining "$used_5h")
+remaining_week=$(remaining "$used_week")
+printf 'CODEX:5H%s%% W%s%%\n' "$remaining_5h" "$remaining_week"

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+# tmux-taskbar extension: report locally known operating-system updates.
+# This is read-only: it inspects package-manager metadata and never installs
+# or refreshes anything.  A = apt packages, F = Flatpak applications.
+
+set -u
+
+apt_updates=0
+flatpak_updates=0
+
+if command -v apt >/dev/null 2>&1; then
+    apt_updates=$(apt list --upgradable 2>/dev/null | awk '
+        NR > 1 && /upgradable from:/ { count++ }
+        END { print count + 0 }
+    ')
+fi
+
+if command -v flatpak >/dev/null 2>&1; then
+    flatpak_updates=$(flatpak remote-ls --updates --columns=application 2>/dev/null | awk '
+        NF { count++ }
+        END { print count + 0 }
+    ')
+fi
+
+case "$apt_updates" in
+    ''|*[!0-9]*) apt_updates=0 ;;
+esac
+case "$flatpak_updates" in
+    ''|*[!0-9]*) flatpak_updates=0 ;;
+esac
+
+printf 'UPD:A%s F%s\n' "$apt_updates" "$flatpak_updates"

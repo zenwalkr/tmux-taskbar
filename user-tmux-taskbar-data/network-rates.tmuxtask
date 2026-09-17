@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+
+# tmux-taskbar extension: show receive and transmit rates for one interface.
+# The taskbar invokes this extension once per second.  The previous counters
+# are kept in the taskbar state directory so the display reflects the latest
+# interval without requiring a long blocking sample here.
+
+set -u
+
+tmux_option() {
+    local option="$1" default_value="$2" value
+    value=$(tmux show-options -gqv "$option" 2>/dev/null || true)
+    [ -n "$value" ] && printf '%s' "$value" || printf '%s' "$default_value"
+}
+
+valid_device_name() {
+    [[ "$1" =~ ^[[:alnum:]_.:@+-]+$ ]]
+}
+
+configured_device=$(tmux_option @tmux_taskbar_network_device auto)
+show_device=$(tmux_option @tmux_taskbar_network_show_device 1)
+if [ "$configured_device" != auto ] && ! valid_device_name "$configured_device"; then
+    configured_device=auto
+fi
+
+device="$configured_device"
+if [ "$device" = auto ]; then
+    # Prefer the interface selected by the default route, then the first
+    # non-loopback interface that is present.
+    if command -v ip >/dev/null 2>&1; then
+        route_device=$(ip route get 1.1.1.1 2>/dev/null | awk '
+            { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }
+        ')
+        if valid_device_name "${route_device:-}" && [ -d "/sys/class/net/$route_device" ]; then
+            device="$route_device"
+        fi
+    fi
+    if [ "$device" = auto ]; then
+        fallback_device=''
+        for interface_path in /sys/class/net/*; do
+            [ -e "$interface_path" ] || continue
+            interface_name=${interface_path##*/}
+            [ "$interface_name" = lo ] && continue
+            if valid_device_name "$interface_name"; then
+                [ -n "$fallback_device" ] || fallback_device="$interface_name"
+                # Prefer an active physical or wireless interface over a
+                # bridge/container interface when there is no default route.
+                if [ -e "$interface_path/device" ] && [ -r "$interface_path/operstate" ] && \
+                   [ "$(<"$interface_path/operstate")" = up ]; then
+                    device="$interface_name"
+                    break
+                fi
+            fi
+        done
+        [ "$device" = auto ] && device="${fallback_device:-auto}"
+    fi
+fi
+
+format_status() {
+    local input_rate="$1" output_rate="$2"
+    if [ "$show_device" = 1 ]; then
+        if [ "$device" = auto ]; then
+            printf 'NET:-- IN:%s OUT:%s\n' "$input_rate" "$output_rate"
+        else
+            printf 'NET:%s IN:%s OUT:%s\n' "$device" "$input_rate" "$output_rate"
+        fi
+    else
+        printf '↓%s↑%s\n' "$input_rate" "$output_rate"
+    fi
+}
+
+if [ "$device" = auto ]; then
+    format_status -- --
+    exit 0
+fi
+
+rx_file="/sys/class/net/$device/statistics/rx_bytes"
+tx_file="/sys/class/net/$device/statistics/tx_bytes"
+if [ ! -r "$rx_file" ] || [ ! -r "$tx_file" ]; then
+    format_status -- --
+    exit 0
+fi
+
+rx_bytes=$(<"$rx_file")
+tx_bytes=$(<"$tx_file")
+if ! [[ "$rx_bytes" =~ ^[0-9]+$ ]] || ! [[ "$tx_bytes" =~ ^[0-9]+$ ]]; then
+    format_status -- --
+    exit 0
+fi
+
+state_root="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/tmux-taskbar"
+state_file="$state_root/network-rates.state"
+mkdir -p "$state_root" 2>/dev/null || true
+
+# Nanoseconds avoid a zero-length interval when tmux refreshes more than once
+# in a second.  GNU date is available on the Linux systems this extension
+# targets; fall back to whole seconds if necessary.
+now_ns=$(date +%s%N 2>/dev/null || true)
+[[ "$now_ns" =~ ^[0-9]+$ ]] || now_ns=$(( $(date +%s 2>/dev/null || printf 0) * 1000000000 ))
+
+previous_device=''
+previous_rx=''
+previous_tx=''
+previous_time=''
+if [ -r "$state_file" ]; then
+    IFS=$'\t' read -r previous_device previous_rx previous_tx previous_time < "$state_file" || true
+fi
+
+rate_in='--'
+rate_out='--'
+if [ "$previous_device" = "$device" ] && \
+   [[ "$previous_rx" =~ ^[0-9]+$ ]] && [[ "$previous_tx" =~ ^[0-9]+$ ]] && \
+   [[ "$previous_time" =~ ^[0-9]+$ ]] && [ "$now_ns" -gt "$previous_time" ]; then
+    rate_in=$(awk -v current="$rx_bytes" -v previous="$previous_rx" \
+        -v now="$now_ns" -v then="$previous_time" 'BEGIN {
+            delta = current - previous
+            if (delta < 0) delta = 0
+            elapsed = (now - then) / 1000000000
+            if (elapsed > 0) printf "%.0f", delta / elapsed
+        }')
+    rate_out=$(awk -v current="$tx_bytes" -v previous="$previous_tx" \
+        -v now="$now_ns" -v then="$previous_time" 'BEGIN {
+            delta = current - previous
+            if (delta < 0) delta = 0
+            elapsed = (now - then) / 1000000000
+            if (elapsed > 0) printf "%.0f", delta / elapsed
+        }')
+    [ -n "$rate_in" ] || rate_in='--'
+    [ -n "$rate_out" ] || rate_out='--'
+fi
+
+format_rate() {
+    local bytes="$1"
+    [ "$bytes" = -- ] && { printf '%s' --; return; }
+    awk -v bytes="$bytes" 'BEGIN {
+        if (bytes < 1024) printf "%.0fB/s", bytes
+        else if (bytes < 1048576) printf "%.1fK/s", bytes / 1024
+        else if (bytes < 1073741824) printf "%.1fM/s", bytes / 1048576
+        else printf "%.1fG/s", bytes / 1073741824
+    }'
+}
+
+printf '%s\t%s\t%s\t%s\n' "$device" "$rx_bytes" "$tx_bytes" "$now_ns" > "$state_file"
+format_status "$(format_rate "$rate_in")" "$(format_rate "$rate_out")"

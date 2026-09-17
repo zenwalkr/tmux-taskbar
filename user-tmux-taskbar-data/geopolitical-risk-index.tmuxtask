@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+
+# tmux-taskbar extension: Caldara–Iacoviello Geopolitical Risk Index.
+#
+# This deliberately uses the historical monthly series from the official GPR
+# page.  The displayed 0–100 score is a taskbar-friendly rescaling: the
+# largest GPRH reading observed during 1939–1945 is 100, and larger readings
+# are capped at 100.  That makes a WWII-level reading the requested 100.
+set -u
+
+CACHE_ROOT="${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/tmux-taskbar-data"
+PAGE_FILE="$CACHE_ROOT/gpr-page.html"
+STAMP_FILE="$CACHE_ROOT/gpr-page.stamp"
+MAX_AGE=21600
+
+mkdir -p "$CACHE_ROOT" 2>/dev/null || true
+now=$(date +%s)
+stamp=0
+[ -r "$STAMP_FILE" ] && read -r stamp < "$STAMP_FILE" || true
+
+if [ ! -s "$PAGE_FILE" ] || ! [[ "$stamp" =~ ^[0-9]+$ ]] || [ $((now - stamp)) -ge "$MAX_AGE" ]; then
+    temp=$(mktemp "$CACHE_ROOT/.gpr-page.XXXXXX" 2>/dev/null || true)
+    if [ -n "$temp" ] && command -v curl >/dev/null 2>&1 && \
+       curl -fsSL --max-time 20 -o "$temp" https://www.matteoiacoviello.com/gpr.htm; then
+        mv -f -- "$temp" "$PAGE_FILE"
+        printf '%s\n' "$now" > "$STAMP_FILE"
+    else
+        [ -n "$temp" ] && rm -f -- "$temp"
+    fi
+fi
+
+[ -s "$PAGE_FILE" ] || { printf '%s\n' 'GPR:--/100'; exit 0; }
+command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'GPR:--/100'; exit 0; }
+
+python3 - "$PAGE_FILE" <<'PY'
+import json
+import re
+import sys
+
+try:
+    page = open(sys.argv[1], encoding="utf-8").read()
+    blocks = re.findall(
+        r'<script type="application/json" data-for="[^"]+">(.*?)</script>',
+        page,
+        re.S,
+    )
+    historical = None
+    for block in blocks:
+        try:
+            chart = json.loads(block).get("x", {})
+        except Exception:
+            continue
+        traces = chart.get("data", [])
+        layout_title = str(chart.get("layout", {}).get("yaxis", {}).get("title", ""))
+        if traces and len(traces[0].get("x", [])) >= 1400 and "1900" in layout_title:
+            historical = traces[0]
+            break
+    if not historical:
+        raise RuntimeError("historical GPR series not found")
+
+    points = []
+    for date, value in zip(historical.get("x", []), historical.get("y", [])):
+        if not date or value is None:
+            continue
+        try:
+            points.append((str(date), float(value)))
+        except (TypeError, ValueError):
+            pass
+    ww2 = [value for date, value in points if 1939 <= int(date[:4]) <= 1945]
+    if not points or not ww2:
+        raise RuntimeError("GPR series is empty")
+    current = points[-1][1]
+    ww2_peak = max(ww2)
+    score = max(0.0, min(100.0, 100.0 * current / ww2_peak))
+    print("GPR:%d/100" % round(score))
+except Exception:
+    print("GPR:--/100")
+PY
