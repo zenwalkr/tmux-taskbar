@@ -29,5 +29,6 @@ ignored by Git; personal settings remain local to the installation.
 
 - Bash
 - tmux
+- `dialog` for the interactive settings menu
 - Linux for the system/network/thermal extensions
 - `curl` and `python3` for the geopolitical-risk extension
